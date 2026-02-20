@@ -1,0 +1,31 @@
+# Binários
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Diretório de build
+/build/
+/dist/
+
+# Dependências baixadas em runtime (yt-dlp, ffmpeg)
+bin/
+
+# Arquivos de teste
+*.test
+
+# Diretório de saída de downloads
+/downloads/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Go
+/vendor/

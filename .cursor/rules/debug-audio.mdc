@@ -1,0 +1,138 @@
+---
+description: Histórico de debug do problema de vídeo sem áudio
+alwaysApply: false
+---
+
+## Problema
+
+Vídeos baixados pelo DownloaderTube saem SEM ÁUDIO.
+
+## Cronologia
+
+### Estado inicial (funcionando)
+- yt-dlp e ffmpeg instalados por sessão anterior do AI
+- App baixava vídeos COM áudio normalmente
+- Código original da função Download usava:
+  - `--no-warnings` (suprime avisos do yt-dlp)
+  - Format string: `bv[height<=H]+ba/b[height<=H]`
+  - Sem `--ffmpeg-location`
+  - Stderr lido apenas para progresso
+
+### Mudança que quebrou (sessão atual)
+- Adicionado pacote `internal/deps/` para auto-download de yt-dlp e ffmpeg
+- `EnsureDependencies()` prepende `%LOCALAPPDATA%\DownloaderTube\bin` ao PATH via `os.Setenv`
+- Removido `CheckDependencies()` do `youtube.go`, substituído por `deps.EnsureDependencies()` no `main.go`
+
+### Tentativas de correção (TODAS falharam)
+
+1. **Adicionado `--ffmpeg-location`**: Piorou — essa flag faz yt-dlp ignorar busca interna e olhar SÓ no dir informado
+2. **Removido `--no-warnings`**: Não resolveu, apenas mostrou warnings do yt-dlp
+3. **Removido fallback `b[height<=H]`**: Piorou — sem fallback, se merge falha, só vídeo sai
+4. **Captura de stderr com detecção de warnings**: Não resolveu
+5. **Revertido Download() ao código original**: Ainda sem áudio
+6. **Restaurado format string com fallback**: Ainda sem áudio
+
+## Testes diretos (fora do Go app)
+
+Executando yt-dlp diretamente no PowerShell COM os binários do binDir:
+- `yt-dlp -f "bv[height<=720]+ba" --merge-output-format mp4 --ffmpeg-location $binDir --embed-thumbnail --embed-metadata --newline -o test.mp4 URL`
+- **RESULTADO: FUNCIONA** — arquivo final tem video av1 + audio opus 2ch + thumbnail png
+- **[Merger] Merging formats** aparece no output → ffmpeg fez o merge corretamente
+
+### Warning importante do yt-dlp
+```
+WARNING: [youtube] No supported JavaScript runtime could be found.
+Only deno is enabled by default; YouTube extraction without a JS runtime
+has been deprecated, and some formats may be missing.
+```
+- NÃO impediu o download de teste, mas pode afetar alguns vídeos
+
+## Estado atual dos binários
+
+- `%LOCALAPPDATA%\DownloaderTube\bin\yt-dlp.exe` — 17.5 MB (v2026.02.04)
+- `%LOCALAPPDATA%\DownloaderTube\bin\ffmpeg.exe` — 190.9 MB (N-122791)
+- `%LOCALAPPDATA%\DownloaderTube\bin\ffprobe.exe` — 190.7 MB
+- yt-dlp e ffmpeg NÃO estão no PATH do sistema (apenas no binDir via os.Setenv)
+
+## CAUSA RAIZ ENCONTRADA
+
+**O áudio ESTAVA no arquivo.** O problema era de CODEC, não de download.
+
+### Evidência (ffprobe nos arquivos do usuário)
+
+| Arquivo | Vídeo | Áudio | Toca no Windows? |
+|---|---|---|---|
+| Arquivo antigo (funcionava) | h264 | **AAC** | SIM |
+| Arquivo novo (sem som) | av1 | **opus** | NÃO |
+
+### Explicação
+
+- yt-dlp versão recente passou a preferir `av1 + opus` (melhor qualidade) sobre `h264 + aac`
+- **opus em container mp4 NÃO é suportado pelo player do Windows** (Movies & TV / Windows Media Player)
+- O áudio estava no arquivo, mas o player ignorava a faixa opus
+
+### Solução
+
+Alterar o format string para priorizar áudio `m4a` (AAC), que é universalmente compatível em mp4:
+
+```
+ANTES:  bv[height<=H]+ba/b[height<=H]
+DEPOIS: bv[height<=H]+ba[ext=m4a]/bv[height<=H]+ba/b[height<=H]
+```
+
+- `ba[ext=m4a]` seleciona formato 140 (AAC 128kbps) em vez de 251 (opus 160kbps)
+- YouTube SEMPRE tem formato 140 (m4a) disponível
+- Fallback `ba` (qualquer áudio) mantido para segurança
+
+### Confirmação
+
+```
+ANTES:  398+251 (av1 + opus)  → sem som no Windows
+DEPOIS: 398+140 (av1 + AAC)   → som em todos os players
+```
+
+## Lições aprendidas
+
+1. `--no-warnings` esconde avisos mas NÃO era a causa do problema
+2. `--ffmpeg-location` override é perigoso (faz yt-dlp ignorar busca interna)
+3. `os.Setenv("PATH")` propaga corretamente para child processes — verificado com programa de teste Go
+4. Sempre verificar o arquivo com `ffprobe` antes de assumir que o áudio está faltando
+
+## Código atual
+
+### main.go
+```go
+func main() {
+    if err := deps.EnsureDependencies(); err != nil { ... }
+    // ...
+}
+```
+
+### deps/manager.go — Trecho chave
+```go
+currentPath := os.Getenv("PATH")
+os.Setenv("PATH", binDir+string(os.PathListSeparator)+currentPath)
+```
+
+### youtube.go — Download (revertido ao original)
+```go
+cmd := exec.Command("yt-dlp",
+    "-f", formatStr,
+    "--merge-output-format", "mp4",
+    "--embed-thumbnail",
+    "--embed-metadata",
+    "--newline",
+    "--no-warnings",
+    "-o", outputTemplate,
+    videoURL,
+)
+```
+
+### youtube.go — Format string (com fallback)
+```go
+// Sem idioma:
+"bv[height<=H]+ba/b[height<=H]"
+
+// Com idioma:
+"bv[height<=H]+ba[language=LANG]/bv[height<=H]+ba/b[height<=H]"
+```
