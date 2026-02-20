@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/webadvance/downloadertube/internal/cli"
-	"github.com/webadvance/downloadertube/internal/config"
-	"github.com/webadvance/downloadertube/internal/deps"
-	"github.com/webadvance/downloadertube/internal/downloader"
+	"github.com/diogocardoso/DownloaderTube/internal/cli"
+	"github.com/diogocardoso/DownloaderTube/internal/config"
+	"github.com/diogocardoso/DownloaderTube/internal/deps"
+	"github.com/diogocardoso/DownloaderTube/internal/downloader"
 )
 
 var version = "dev"

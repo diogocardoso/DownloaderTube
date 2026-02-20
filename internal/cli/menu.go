@@ -8,9 +8,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/webadvance/downloadertube/internal/config"
-	"github.com/webadvance/downloadertube/internal/downloader"
-	"github.com/webadvance/downloadertube/pkg/validator"
+	"github.com/diogocardoso/DownloaderTube/internal/config"
+	"github.com/diogocardoso/DownloaderTube/internal/downloader"
+	"github.com/diogocardoso/DownloaderTube/pkg/validator"
 )
 
 type App struct {

@@ -24,7 +24,7 @@ As dependências externas (**yt-dlp** e **FFmpeg**) são baixadas automaticament
 ## Instalação
 
 ```bash
-git clone https://github.com/webadvance/downloadertube.git
+git clone https://github.com/diogocardoso/DownloaderTube.git
 cd downloadertube
 go build -o downloadertube ./cmd
 ```
