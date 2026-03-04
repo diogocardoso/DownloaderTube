@@ -261,6 +261,18 @@ func (a *App) startDownload(url string, info *downloader.VideoInfo, formatIdx in
 
 	progress := func(current, total int64) {
 		if total <= 0 {
+			// Fallback: algumas saídas do yt-dlp trazem apenas percentual.
+			if current < 0 {
+				current = 0
+			}
+			if current > 100 {
+				current = 100
+			}
+			pct := float64(current)
+			barLen := 30
+			filled := int(pct / 100 * float64(barLen))
+			bar := strings.Repeat("█", filled) + strings.Repeat("░", barLen-filled)
+			fmt.Printf("\r [%s] %.0f%%", bar, pct)
 			return
 		}
 		pct := float64(current) / float64(total) * 100
@@ -293,6 +305,14 @@ func (a *App) startDownload(url string, info *downloader.VideoInfo, formatIdx in
 
 	if result.FilePath != "" {
 		a.showFileInfo(result.FilePath)
+	}
+
+	if result.CompatibilityWarning != "" {
+		fmt.Println()
+		fmt.Printf(" [AVISO] Compatibilidade WhatsApp: %s\n", result.CompatibilityWarning)
+	} else if result.FilePath != "" {
+		fmt.Println()
+		fmt.Println(" Compatibilidade WhatsApp: OK (MP4/H.264/AAC)")
 	}
 
 	a.printFooter()

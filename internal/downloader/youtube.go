@@ -1,7 +1,6 @@
 package downloader
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,7 +20,6 @@ func NewYouTube() *YouTubeDownloader {
 	return &YouTubeDownloader{}
 }
 
-
 type ytdlpInfo struct {
 	Title          string        `json:"title"`
 	DurationString string        `json:"duration_string"`
@@ -29,14 +27,14 @@ type ytdlpInfo struct {
 }
 
 type ytdlpFormat struct {
-	FormatID   string  `json:"format_id"`
-	Ext        string  `json:"ext"`
-	Height     int     `json:"height"`
-	VCodec     string  `json:"vcodec"`
-	ACodec     string  `json:"acodec"`
-	Language   string  `json:"language"`
-	FormatNote string  `json:"format_note"`
-	Filesize   float64 `json:"filesize"`
+	FormatID       string  `json:"format_id"`
+	Ext            string  `json:"ext"`
+	Height         int     `json:"height"`
+	VCodec         string  `json:"vcodec"`
+	ACodec         string  `json:"acodec"`
+	Language       string  `json:"language"`
+	FormatNote     string  `json:"format_note"`
+	Filesize       float64 `json:"filesize"`
 	FilesizeApprox float64 `json:"filesize_approx"`
 }
 
@@ -154,12 +152,18 @@ func (yd *YouTubeDownloader) GetVideoInfo(rawURL string) (*VideoInfo, error) {
 func (yd *YouTubeDownloader) Download(videoURL string, height int, langCode string, dest string, progress func(current, total int64)) (DownloadResult, error) {
 	outputTemplate := filepath.Join(dest, "%(title)s.%(ext)s")
 	formatStr := buildFormatString(height, langCode)
+	startedAt := time.Now()
+	debugLogf("[youtube] start url=%s height=%d lang=%s format=%s", videoURL, height, langCode, formatStr)
 
 	cmd := exec.Command("yt-dlp",
 		"-f", formatStr,
+		"--progress",
+		"--progress-template", "download:__DT_PROGRESS__:%(progress.downloaded_bytes)s:%(progress.total_bytes)s:%(progress.total_bytes_estimate)s:%(progress._percent_str)s",
 		"--merge-output-format", "mp4",
 		"--embed-thumbnail",
 		"--embed-metadata",
+		"--print", "after_move:__DT_PATH__:%(filepath)s",
+		"--print", "after_move:__DT_ID__:%(id)s",
 		"--newline",
 		"--no-warnings",
 		"-o", outputTemplate,
@@ -177,28 +181,34 @@ func (yd *YouTubeDownloader) Download(videoURL string, height int, langCode stri
 	}
 
 	if err := cmd.Start(); err != nil {
+		debugLogf("[youtube] cmd start error: %v", err)
 		return DownloadResult{}, fmt.Errorf("erro ao iniciar yt-dlp: %w", err)
 	}
 
-	progressRegex := regexp.MustCompile(`\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+)([\w]+)`)
-
 	var filePath string
+	var mediaID string
 	var mu sync.Mutex
 
 	parseLine := func(line string) {
-		if matches := progressRegex.FindStringSubmatch(line); len(matches) >= 4 && progress != nil {
-			pct, _ := strconv.ParseFloat(matches[1], 64)
-			totalVal, _ := strconv.ParseFloat(matches[2], 64)
-			unit := matches[3]
-
-			totalBytes := toBytes(totalVal, unit)
-			currentBytes := int64(float64(totalBytes) * pct / 100)
-
-			progress(currentBytes, totalBytes)
+		if strings.Contains(line, "[download]") || strings.Contains(line, "ERROR") || strings.Contains(line, "WARNING") {
+			debugLogf("[youtube] line: %s", line)
+		}
+		if progress != nil {
+			if currentVal, totalVal, ok := parseProgressLine(line); ok {
+				debugLogf("[youtube] progress parsed current=%d total=%d", currentVal, totalVal)
+				progress(currentVal, totalVal)
+			}
 		}
 		if p := extractFilePath(line); p != "" {
+			debugLogf("[youtube] file path detected: %s", p)
 			mu.Lock()
 			filePath = p
+			mu.Unlock()
+		}
+		if id := extractMediaID(line); id != "" {
+			debugLogf("[youtube] media id detected: %s", id)
+			mu.Lock()
+			mediaID = id
 			mu.Unlock()
 		}
 	}
@@ -208,27 +218,43 @@ func (yd *YouTubeDownloader) Download(videoURL string, height int, langCode stri
 
 	go func() {
 		defer wg.Done()
-		scanner := bufio.NewScanner(stdoutPipe)
+		scanner := newProgressScanner(stdoutPipe)
 		for scanner.Scan() {
 			parseLine(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			debugLogf("[youtube] stdout scanner error: %v", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		scanner := bufio.NewScanner(stderrPipe)
+		scanner := newProgressScanner(stderrPipe)
 		for scanner.Scan() {
 			parseLine(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			debugLogf("[youtube] stderr scanner error: %v", err)
 		}
 	}()
 
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
+		debugLogf("[youtube] cmd wait error: %v", err)
 		return DownloadResult{}, fmt.Errorf("erro durante download: %w", err)
 	}
 
-	return DownloadResult{FilePath: filePath}, nil
+	resolvedPath := resolveDownloadedFile(filePath, dest, mediaID, startedAt)
+	debugLogf("[youtube] resolved path parsed=%s resolved=%s", filePath, resolvedPath)
+	finalPath, warning := ensureWhatsAppCompatible(resolvedPath)
+	namedPath, nameWarning := ensurePlatformFileName(finalPath, "youtube", mediaID)
+	debugLogf("[youtube] done filePath=%s finalPath=%s namedPath=%s mediaID=%s warning=%s nameWarning=%s", resolvedPath, finalPath, namedPath, mediaID, warning, nameWarning)
+
+	return DownloadResult{
+		FilePath:             namedPath,
+		CompatibilityWarning: joinWarnings(warning, nameWarning),
+	}, nil
 }
 
 func buildFormatString(height int, langCode string) string {
@@ -242,29 +268,34 @@ func buildFormatString(height int, langCode string) string {
 		base := strings.SplitN(langCode, "-", 2)[0]
 		if base != langCode {
 			return fmt.Sprintf(
-				"bv[height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/b[language=%s][height<=%s]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
-				h, langCode, h, base, langCode, h, base, h, h, h, h,
+				"bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a][language=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/b[language=%s][height<=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
+				h, langCode, h, langCode, h, langCode, h, base, langCode, h, base, h, h, h, h, h,
 			)
 		}
 		return fmt.Sprintf(
-			"bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
-			h, langCode, langCode, h, h, h, h,
+			"bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a][language=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
+			h, langCode, h, langCode, h, langCode, langCode, h, h, h, h, h,
 		)
 	}
 
-	return fmt.Sprintf("bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]", h, h, h)
+	return fmt.Sprintf("bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]", h, h, h, h)
 }
 
 var (
-	mergerRegex   = regexp.MustCompile(`\[Merger\] Merging formats into "(.+)"`)
-	moveRegex     = regexp.MustCompile(`\[MoveFiles\] Moving file ".+" to "(.+)"`)
-	destRegex     = regexp.MustCompile(`\[download\] Destination: (.+)`)
-	alreadyRegex  = regexp.MustCompile(`\[download\] (.+) has already been downloaded`)
+	mergerRegex  = regexp.MustCompile(`\[Merger\] Merging formats into "(.+)"`)
+	moveRegex    = regexp.MustCompile(`\[MoveFiles\] Moving file ".+" to "(.+)"`)
+	destRegex    = regexp.MustCompile(`\[download\] Destination: (.+)`)
+	alreadyRegex = regexp.MustCompile(`\[download\] (.+) has already been downloaded`)
+	printRegex   = regexp.MustCompile(`^__DT_PATH__:(.+)$`)
+	idPrintRegex = regexp.MustCompile(`^__DT_ID__:(.+)$`)
 )
 
 // extractFilePath extrai o caminho do arquivo final da saída do yt-dlp.
 // Prioridade: MoveFiles > Merger > Destination (último capturado vence).
 func extractFilePath(line string) string {
+	if m := printRegex.FindStringSubmatch(strings.TrimSpace(line)); len(m) >= 2 {
+		return strings.TrimSpace(m[1])
+	}
 	if m := moveRegex.FindStringSubmatch(line); len(m) >= 2 {
 		return m[1]
 	}
@@ -280,15 +311,9 @@ func extractFilePath(line string) string {
 	return ""
 }
 
-func toBytes(val float64, unit string) int64 {
-	switch strings.ToLower(unit) {
-	case "kib":
-		return int64(val * 1024)
-	case "mib":
-		return int64(val * 1024 * 1024)
-	case "gib":
-		return int64(val * 1024 * 1024 * 1024)
-	default:
-		return int64(val)
+func extractMediaID(line string) string {
+	if m := idPrintRegex.FindStringSubmatch(strings.TrimSpace(line)); len(m) >= 2 {
+		return sanitizeID(m[1])
 	}
+	return ""
 }

@@ -22,7 +22,8 @@ type AudioLang struct {
 
 // DownloadResult contém o resultado de um download bem-sucedido.
 type DownloadResult struct {
-	FilePath string
+	FilePath             string
+	CompatibilityWarning string
 }
 
 // Downloader define a interface para qualquer plataforma de download.
