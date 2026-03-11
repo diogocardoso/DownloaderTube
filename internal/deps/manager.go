@@ -13,6 +13,13 @@ import (
 	"time"
 )
 
+const (
+	ytDlpChannelEnv     = "DT_YTDLP_CHANNEL"
+	ytDlpChannelStable  = "stable"
+	ytDlpChannelNightly = "nightly"
+	ytDlpDefaultChannel = ytDlpChannelNightly
+)
+
 func getBinDir() (string, error) {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
@@ -48,7 +55,7 @@ func EnsureDependencies() error {
 	currentPath := os.Getenv("PATH")
 	os.Setenv("PATH", binDir+string(os.PathListSeparator)+currentPath)
 
-	needYtDlp := !isAvailable("yt-dlp")
+	needYtDlp := shouldInstallManagedYtDlp(binDir)
 	needFfmpeg := !isAvailable("ffmpeg")
 
 	if !needYtDlp && !needFfmpeg {
@@ -103,20 +110,74 @@ func verifyDependencies() error {
 }
 
 func installYtDlp(binDir string) error {
+	channel := ytDlpChannel()
 	var url string
-	switch runtime.GOOS {
-	case "windows":
-		url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-	case "linux":
-		url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
-	case "darwin":
-		url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
-	default:
-		return fmt.Errorf("plataforma %s não suportada para auto-download do yt-dlp", runtime.GOOS)
+	if channel == ytDlpChannelNightly {
+		switch runtime.GOOS {
+		case "windows":
+			url = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe"
+		case "linux":
+			url = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp"
+		case "darwin":
+			url = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos"
+		default:
+			return fmt.Errorf("plataforma %s não suportada para auto-download do yt-dlp", runtime.GOOS)
+		}
+	} else {
+		switch runtime.GOOS {
+		case "windows":
+			url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+		case "linux":
+			url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+		case "darwin":
+			url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+		default:
+			return fmt.Errorf("plataforma %s não suportada para auto-download do yt-dlp", runtime.GOOS)
+		}
 	}
 
 	destPath := filepath.Join(binDir, binaryName("yt-dlp"))
 	return downloadFile(url, destPath, "yt-dlp")
+}
+
+func ytDlpChannel() string {
+	channel := strings.ToLower(strings.TrimSpace(os.Getenv(ytDlpChannelEnv)))
+	switch channel {
+	case "", ytDlpChannelNightly:
+		return ytDlpChannelNightly
+	case ytDlpChannelStable:
+		return ytDlpChannelStable
+	default:
+		return ytDlpDefaultChannel
+	}
+}
+
+func shouldInstallManagedYtDlp(binDir string) bool {
+	managedPath := filepath.Join(binDir, binaryName("yt-dlp"))
+	if _, err := os.Stat(managedPath); err != nil {
+		return true
+	}
+	version, err := getBinaryVersion(managedPath)
+	if err != nil {
+		return true
+	}
+	channel := ytDlpChannel()
+	if channel == ytDlpChannelNightly && !strings.Contains(version, "nightly@") {
+		return true
+	}
+	if channel == ytDlpChannelStable && strings.Contains(version, "nightly@") {
+		return true
+	}
+	return false
+}
+
+func getBinaryVersion(path string) (string, error) {
+	cmd := exec.Command(path, "--version")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func installFfmpeg(binDir string) error {

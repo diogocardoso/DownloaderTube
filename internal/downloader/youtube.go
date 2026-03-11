@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -34,6 +36,8 @@ type ytdlpFormat struct {
 	ACodec         string  `json:"acodec"`
 	Language       string  `json:"language"`
 	FormatNote     string  `json:"format_note"`
+	Format         string  `json:"format"`
+	URL            string  `json:"url"`
 	Filesize       float64 `json:"filesize"`
 	FilesizeApprox float64 `json:"filesize_approx"`
 }
@@ -80,12 +84,159 @@ func baseLang(code string) string {
 	return strings.SplitN(code, "-", 2)[0]
 }
 
+func youtubeCookiesFromBrowser() string {
+	return strings.TrimSpace(os.Getenv("DT_COOKIES_FROM_BROWSER"))
+}
+
+func youtubeExtractorArgs() string {
+	return strings.TrimSpace(os.Getenv("DT_YT_EXTRACTOR_ARGS"))
+}
+
+func appendYouTubeExtractorArgs(args []string) []string {
+	extractorArgs := youtubeExtractorArgs()
+	if extractorArgs == "" {
+		return args
+	}
+	return append(args, "--extractor-args", extractorArgs)
+}
+
+func youtubeCookiesArgs() []string {
+	browser := youtubeCookiesFromBrowser()
+	if browser == "" {
+		return nil
+	}
+	return []string{"--cookies-from-browser", browser}
+}
+
+func shouldRetryWithoutCookies(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cookie database") || strings.Contains(msg, "cookies-from-browser")
+}
+
+func collectAudioLanguages(formats []ytdlpFormat) []AudioLang {
+	langSet := make(map[string]struct{})
+	for _, f := range formats {
+		if f.ACodec == "none" {
+			continue
+		}
+		code := detectLanguageCode(f)
+		if code == "" {
+			continue
+		}
+		langSet[code] = struct{}{}
+	}
+
+	var languages []AudioLang
+	for code := range langSet {
+		languages = append(languages, AudioLang{
+			Code: code,
+			Name: resolveLangName(code),
+		})
+	}
+
+	sort.Slice(languages, func(i, j int) bool {
+		if languages[i].Name == languages[j].Name {
+			return languages[i].Code < languages[j].Code
+		}
+		return languages[i].Name < languages[j].Name
+	})
+
+	return languages
+}
+
+var (
+	langBracketRegex = regexp.MustCompile(`[\[\(]([a-z]{2,3}(?:-[A-Za-z0-9]{2,})?)[\]\)]`)
+	langQueryRegex   = regexp.MustCompile(`(?:^|[?&:])(?:lang|language)=([a-z]{2,3}(?:-[A-Za-z0-9]{2,})?)`)
+)
+
+func detectLanguageCode(f ytdlpFormat) string {
+	if code := normalizeLanguageCode(f.Language); code != "" {
+		return code
+	}
+	if code := detectLanguageInText(f.Format); code != "" {
+		return code
+	}
+	if code := detectLanguageInText(f.FormatNote); code != "" {
+		return code
+	}
+	return detectLanguageInURL(f.URL)
+}
+
+func detectLanguageInText(text string) string {
+	if text == "" {
+		return ""
+	}
+	matches := langBracketRegex.FindAllStringSubmatch(text, -1)
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		if code := normalizeLanguageCode(m[1]); code != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+func detectLanguageInURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	decoded, err := url.QueryUnescape(raw)
+	if err != nil {
+		decoded = raw
+	}
+	if m := langQueryRegex.FindStringSubmatch(strings.ToLower(decoded)); len(m) >= 2 {
+		return normalizeLanguageCode(m[1])
+	}
+	return ""
+}
+
+func normalizeLanguageCode(code string) string {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return ""
+	}
+	code = strings.ReplaceAll(code, "_", "-")
+	parts := strings.Split(code, "-")
+	if len(parts) == 0 {
+		return ""
+	}
+	parts[0] = strings.ToLower(parts[0])
+	if len(parts[0]) < 2 || len(parts[0]) > 3 {
+		return ""
+	}
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "" {
+			return ""
+		}
+		parts[i] = strings.ToUpper(parts[i])
+	}
+	return strings.Join(parts, "-")
+}
+
 func (yd *YouTubeDownloader) GetVideoInfo(rawURL string) (*VideoInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "yt-dlp", "-j", "--no-warnings", rawURL)
+	cookieArgs := youtubeCookiesArgs()
+	args := []string{"-j", "--no-warnings"}
+	args = appendYouTubeExtractorArgs(args)
+	args = append(args, cookieArgs...)
+	args = append(args, rawURL)
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	output, err := cmd.Output()
+	if err != nil && len(cookieArgs) > 0 && shouldRetryWithoutCookies(err) {
+		debugLogf("[youtube] GetVideoInfo cookies failed, retry without cookies: %v", err)
+		retryArgs := []string{"-j", "--no-warnings"}
+		retryArgs = appendYouTubeExtractorArgs(retryArgs)
+		retryArgs = append(retryArgs, rawURL)
+		cmd = exec.CommandContext(ctx, "yt-dlp", retryArgs...)
+		output, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("erro ao obter info do vídeo: %w", err)
 	}
@@ -116,30 +267,7 @@ func (yd *YouTubeDownloader) GetVideoInfo(rawURL string) (*VideoInfo, error) {
 		return formats[i].Height < formats[j].Height
 	})
 
-	// Detecta idiomas de TODOS os formatos com áudio (incluindo combinados HLS)
-	langMap := make(map[string]string) // baseLang -> código mais específico
-	for _, f := range info.Formats {
-		if f.ACodec == "none" || f.Language == "" {
-			continue
-		}
-		base := baseLang(f.Language)
-		existing, exists := langMap[base]
-		if !exists || len(f.Language) > len(existing) {
-			langMap[base] = f.Language
-		}
-	}
-
-	var languages []AudioLang
-	for _, code := range langMap {
-		languages = append(languages, AudioLang{
-			Code: code,
-			Name: resolveLangName(code),
-		})
-	}
-
-	sort.Slice(languages, func(i, j int) bool {
-		return languages[i].Name < languages[j].Name
-	})
+	languages := collectAudioLanguages(info.Formats)
 
 	return &VideoInfo{
 		Title:     info.Title,
@@ -154,8 +282,15 @@ func (yd *YouTubeDownloader) Download(videoURL string, height int, langCode stri
 	formatStr := buildFormatString(height, langCode)
 	startedAt := time.Now()
 	debugLogf("[youtube] start url=%s height=%d lang=%s format=%s", videoURL, height, langCode, formatStr)
+	cookieBrowser := youtubeCookiesFromBrowser()
+	if cookieBrowser != "" {
+		debugLogf("[youtube] cookies-from-browser enabled: %s", cookieBrowser)
+	}
+	if extractorArgs := youtubeExtractorArgs(); extractorArgs != "" {
+		debugLogf("[youtube] extractor-args enabled: %s", extractorArgs)
+	}
 
-	cmd := exec.Command("yt-dlp",
+	args := []string{
 		"-f", formatStr,
 		"--progress",
 		"--progress-template", "download:__DT_PROGRESS__:%(progress.downloaded_bytes)s:%(progress.total_bytes)s:%(progress.total_bytes_estimate)s:%(progress._percent_str)s",
@@ -167,8 +302,11 @@ func (yd *YouTubeDownloader) Download(videoURL string, height int, langCode stri
 		"--newline",
 		"--no-warnings",
 		"-o", outputTemplate,
-		videoURL,
-	)
+	}
+	args = appendYouTubeExtractorArgs(args)
+	args = append(args, youtubeCookiesArgs()...)
+	args = append(args, videoURL)
+	cmd := exec.Command("yt-dlp", args...)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -261,24 +399,23 @@ func buildFormatString(height int, langCode string) string {
 	h := strconv.Itoa(height)
 
 	if langCode != "" {
-		// 1) bv+ba[language=X]       → faixas dedicadas (idioma original, melhor qualidade)
-		// 2) b[language=X][height<=H] → streams HLS combinados (idiomas alternativos)
-		// 3) bv+ba[ext=m4a]           → fallback sem filtro de idioma
-		// 4) bv+ba / b               → último recurso
+		// 1) bv+ba[language=X]         -> faixas dedicadas quando existirem
+		// 2) b[language=X][height<=H]  -> streams HLS combinados para multi-audio
+		// 3) fallback sem idioma por ultimo, para manter download funcional
 		base := strings.SplitN(langCode, "-", 2)[0]
 		if base != langCode {
 			return fmt.Sprintf(
-				"bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a][language=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/b[language=%s][height<=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
-				h, langCode, h, langCode, h, langCode, h, base, langCode, h, base, h, h, h, h, h,
+				"bv[height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/b[language=%s][height<=%s]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
+				h, langCode, h, base, langCode, h, base, h, h, h, h,
 			)
 		}
 		return fmt.Sprintf(
-			"bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a][language=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[language=%s]/bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
-			h, langCode, h, langCode, h, langCode, langCode, h, h, h, h, h,
+			"bv[height<=%s]+ba[language=%s]/b[language=%s][height<=%s]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]",
+			h, langCode, langCode, h, h, h, h,
 		)
 	}
 
-	return fmt.Sprintf("bv[vcodec~='^(avc1|h264)'][height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]", h, h, h, h)
+	return fmt.Sprintf("bv[height<=%s]+ba[ext=m4a]/bv[height<=%s]+ba/b[height<=%s]", h, h, h)
 }
 
 var (

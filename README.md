@@ -35,6 +35,60 @@ go build -o downloadertube ./cmd
 ./downloadertube
 ```
 
+### Opcional: usar cookies do navegador no YouTube
+
+Em alguns vídeos, o YouTube só expõe certas trilhas de áudio quando a requisição está autenticada.
+Para esses casos, defina a variável de ambiente abaixo antes de abrir o app:
+
+- Windows (PowerShell):
+
+```powershell
+$env:DT_COOKIES_FROM_BROWSER="chrome"
+```
+
+- Linux/macOS (bash):
+
+```bash
+export DT_COOKIES_FROM_BROWSER=chrome
+```
+
+Valores comuns: `chrome`, `firefox`, `edge`.
+Se a variável não estiver definida, o comportamento padrão atual é mantido.
+
+### Opcional: forçar estratégia de extração do YouTube
+
+Em alguns vídeos com multi-áudio, o YouTube pode omitir formatos no resultado padrão.
+Para esses casos, é possível forçar `extractor-args` no `yt-dlp` usado pelo app:
+
+- Windows (PowerShell):
+
+```powershell
+$env:DT_YT_EXTRACTOR_ARGS="youtube:player_client=all;formats=missing_pot"
+```
+
+- Linux/macOS (bash):
+
+```bash
+export DT_YT_EXTRACTOR_ARGS="youtube:player_client=all;formats=missing_pot"
+```
+
+Observação:
+- Essa configuração ajuda o menu de idiomas a exibir trilhas que não aparecem no modo padrão.
+- Alguns formatos listados como `MISSING POT` podem falhar no download com `403` dependendo da sessão/token.
+
+### Opcional: canal do yt-dlp gerenciado
+
+O app suporta seleção do canal do `yt-dlp` gerenciado:
+
+- `DT_YTDLP_CHANNEL=nightly` (recomendado para cenários com mudanças recentes do YouTube)
+- `DT_YTDLP_CHANNEL=stable`
+
+Exemplo (PowerShell):
+
+```powershell
+$env:DT_YTDLP_CHANNEL="nightly"
+```
+
 O menu principal será exibido:
 
 ```
